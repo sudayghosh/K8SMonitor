@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k8s-monitor-config
+  namespace: monitoring
+data:
+  TAIL_LINES: "50"
+  CHECK_INTERVAL_SECONDS: "300"
+  NAMESPACES: "default kube-system"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: k8s-monitor-secrets
+  namespace: monitoring
+type: Opaque
+stringData:
+  OPENAI_API_KEY: "sk-your-key-here"
+  GITHUB_TOKEN: "ghp_your-token-here"
+  GITHUB_OWNER: "your-username"
+  GITHUB_REPO: "example-voting-app"
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: k8s-monitor
+  namespace: monitoring
+spec:
+  # Run every 5 minutes
+  schedule: "*/5 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: k8s-monitor
+          containers:
+          - name: monitor
+            image: ghcr.io/your-username/k8s-monitor:latest
+            imagePullPolicy: IfNotPresent
+            envFrom:
+            - configMapRef:
+                name: k8s-monitor-config
+            - secretRef:
+                name: k8s-monitor-secrets
+            env:
+            - name: DRY_RUN
+              value: "false"
+            - name: GITHUB_BASE_BRANCH
+              value: "main"
+            resources:
+              requests:
+                cpu: 100m
+                memory: 256Mi
+              limits:
+                cpu: 500m
+                memory: 512Mi
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+          restartPolicy: OnFailure
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-monitor
+  namespace: monitoring
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-monitor
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-monitor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-monitor
+subjects:
+- kind: ServiceAccount
+  name: k8s-monitor
+  namespace: monitoring
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring

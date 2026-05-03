@@ -1,0 +1,192 @@
+﻿using System.Text;
+using k8s;
+using K8SMonitor.Configuration;
+using K8SMonitor.Services;
+
+
+DotNetEnv.Env.Load(); // loads .env from current directory
+// Load configuration from environment variables
+var config = new K8SMonitorConfig
+{
+    OpenAIApiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY") ?? string.Empty,
+    GitHubToken = Environment.GetEnvironmentVariable("GITHUB_TOKEN") ?? string.Empty,
+    GitHubOwner = Environment.GetEnvironmentVariable("GITHUB_OWNER") ?? "sudayghosh",
+    GitHubRepo = Environment.GetEnvironmentVariable("GITHUB_REPO") ?? "example-voting-app",
+    GitHubBaseBranch = Environment.GetEnvironmentVariable("GITHUB_BASE_BRANCH") ?? "main",
+    DryRun = Environment.GetEnvironmentVariable("DRY_RUN")?.ToLower() == "true"
+};
+
+config.Validate();
+
+Console.WriteLine("╔═══════════════════════════════════════════════════════╗");
+Console.WriteLine("║         K8S Monitor with AI Auto-Fix                 ║");
+Console.WriteLine("╚═══════════════════════════════════════════════════════╝\n");
+
+try
+{
+    // Initialize Kubernetes client
+    Console.WriteLine("📡 Connecting to Kubernetes cluster...");
+    var kubernetesConfig = KubernetesClientConfiguration.BuildConfigFromConfigFile();
+    var kubeClient = new Kubernetes(kubernetesConfig);
+    
+    var analyzer = new KubernetesLogAnalyzer(kubeClient);
+    var openAI = new OpenAIService(config.OpenAIApiKey);
+    var githubPR = new GitHubPRService(config.GitHubToken, config.GitHubOwner, config.GitHubRepo, config.GitHubBaseBranch);
+
+    // Get cluster information
+    Console.WriteLine("✓ Connected to cluster\n");
+    
+    Console.WriteLine("📊 CLUSTER INFORMATION");
+    Console.WriteLine("═══════════════════════════════════════════════════════");
+    
+    var nodes = await analyzer.GetNodesAsync();
+    Console.WriteLine($"\nNodes: {nodes.Count}");
+    foreach (var node in nodes)
+    {
+        var readyStatus = node.Ready ? "✓ Ready" : "✗ NotReady";
+        Console.WriteLine($"  • {node.Name} - {readyStatus}");
+    }
+
+    // Analyze all pods for errors
+    Console.WriteLine("\n🔍 ANALYZING POD LOGS FOR ERRORS");
+    Console.WriteLine("═══════════════════════════════════════════════════════");
+    
+    var allAnalyses = new List<(string Namespace, PodLogAnalysis Analysis)>();
+    
+    foreach (var ns in config.Namespaces)
+    {
+        try
+        {
+            Console.WriteLine($"\nScanning namespace: {ns}");
+            var analyses = await analyzer.AnalyzeAllPodsInNamespaceAsync(ns, config.TailLines);
+            
+            foreach (var analysis in analyses)
+            {
+                allAnalyses.Add((ns, analysis));
+                
+                if (analysis.HasErrors)
+                {
+                    Console.WriteLine($"  ⚠️  {analysis.PodName}: {analysis.ErrorCount} error(s) found");
+                    foreach (var errorLine in analysis.ErrorLines.Take(3))
+                    {
+                        Console.WriteLine($"      • {errorLine.Substring(0, Math.Min(80, errorLine.Length))}...");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  ⚠️  Error scanning namespace {ns}: {ex.Message}");
+        }
+    }
+
+    // Process errors with AI and create PRs
+    var errorAnalyses = allAnalyses.Where(a => a.Analysis.HasErrors).ToList();
+    
+    if (errorAnalyses.Any())
+    {
+        Console.WriteLine("\n🤖 ANALYZING ERRORS WITH OPENAI GPT-4o Mini");
+        Console.WriteLine("═══════════════════════════════════════════════════════");
+        
+        var prCount = 0;
+        
+        foreach (var (ns, analysis) in errorAnalyses)
+        {
+            try
+            {
+                Console.WriteLine($"\n[{analysis.PodName}] Sending error analysis to OpenAI...");
+                
+                // Get AI analysis
+                var aiAnalysis = await openAI.AnalyzePodErrorAsync(
+                    analysis.PodName,
+                    ns,
+                    $"Error Count: {analysis.ErrorCount}\n\nError Lines:\n" + 
+                    string.Join("\n", analysis.ErrorLines.Take(10))
+                );
+                
+                Console.WriteLine($"✓ AI Analysis Complete:");
+                Console.WriteLine($"───────────────────────────────────────────────────");
+                var analysisLines = aiAnalysis.Split('\n').Take(5);
+                foreach (var line in analysisLines)
+                {
+                    if (!string.IsNullOrWhiteSpace(line))
+                        Console.WriteLine($"  {line}");
+                }
+                
+                if (!config.DryRun && config.EnableAutoPR)
+                {
+                    // Generate PR title and description
+                    var prInfo = await openAI.GeneratePullRequestTitleAndDescriptionAsync(
+                        analysis.PodName,
+                        analysis.ErrorLines.First()
+                    );
+                    
+                    // Create branch name with timestamp
+                    var branchName = $"k8s-fix-{analysis.PodName.ToLower()}-{DateTimeOffset.Now.ToUnixTimeSeconds()}";
+                    
+                    // Parse PR info
+                    var (title, description) = ParsePRInfo(prInfo);
+                    
+                    // Create PR
+                    Console.WriteLine($"\n📝 Creating Pull Request...");
+                    var prNumber = await githubPR.CreatePullRequestAsync(
+                        branchName,
+                        title,
+                        $"{description}\n\n**Pod:** {analysis.PodName}\n**Namespace:** {ns}\n\n**Errors Found:**\n" + 
+                        string.Join("\n", analysis.ErrorLines.Take(5).Select(e => $"- {e}")),
+                        $"FIXES_K8S_{analysis.PodName}_{DateTimeOffset.Now.ToUnixTimeSeconds()}.md"
+                    );
+                    
+                    prCount++;
+                    Console.WriteLine($"✓ Pull Request created: #{prNumber}");
+                }
+                else if (config.DryRun)
+                {
+                    Console.WriteLine($"[DRY RUN] Would create PR for {analysis.PodName}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"✗ Error processing {analysis.PodName}: {ex.Message}");
+            }
+        }
+        
+        Console.WriteLine($"\n📊 Summary: {prCount} pull request(s) created");
+    }
+    else
+    {
+        Console.WriteLine("\n✓ No errors found in cluster pods - everything looks good!");
+    }
+    
+    Console.WriteLine("\n✓ K8S Monitor completed successfully");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"\n✗ FATAL ERROR: {ex.Message}");
+    Console.WriteLine($"Stack Trace: {ex.StackTrace}");
+    Environment.Exit(1);
+}
+
+/// <summary>
+/// Parse PR info from OpenAI response
+/// </summary>
+static (string Title, string Description) ParsePRInfo(string prInfo)
+{
+    var lines = prInfo.Split('\n');
+    var title = "Auto-fix from K8SMonitor";
+    var description = "AI-generated fix based on pod error analysis";
+    
+    foreach (var line in lines)
+    {
+        if (line.StartsWith("TITLE:", StringComparison.OrdinalIgnoreCase))
+        {
+            title = line.Replace("TITLE:", string.Empty, StringComparison.OrdinalIgnoreCase).Trim();
+        }
+        else if (line.StartsWith("DESCRIPTION:", StringComparison.OrdinalIgnoreCase))
+        {
+            description = line.Replace("DESCRIPTION:", string.Empty, StringComparison.OrdinalIgnoreCase).Trim();
+        }
+    }
+    
+    return (title, description);
+}
