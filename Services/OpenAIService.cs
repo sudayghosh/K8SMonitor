@@ -62,26 +62,49 @@ Please provide actionable fixes that can be implemented immediately.";
         }
     }
 
-    public async Task<CodeFix> GenerateCodeFixAsync(string podName, string namespaceName, string errorLogs, string? deploymentYaml = null)
+    public async Task<string> IdentifyBuggyFileAsync(string errorLogs)
     {
         try
         {
-            var systemPrompt = @"You are an expert C# and Kubernetes developer. Your task is to analyze pod errors and generate exact code fixes.
+            var systemPrompt = @"You are a Kubernetes and C# expert. 
+Based on the error logs and stack traces provided, identify the most likely file path in the repository that needs to be fixed.
+Return ONLY the exact file path string (e.g., Program.cs or Services/MyService.cs) with no other text, quotes, or markdown. If you cannot determine the file, return 'unknown'.";
+
+            var userPrompt = $"Error Logs:\n{errorLogs}";
+
+            var messages = new List<ChatMessage>
+            {
+                new SystemChatMessage(systemPrompt),
+                new UserChatMessage(userPrompt)
+            };
+
+            var completion = await _client.CompleteChatAsync(messages);
+            var result = completion.Value.Content[0].Text?.Trim() ?? "unknown";
+            
+            // Clean up possible markdown or quotes
+            result = result.Trim('`', '\"', '\'');
+            return result;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"Failed to identify buggy file: {ex.Message}", ex);
+        }
+    }
+
+    public async Task<CodeFix> GenerateCodeFixAsync(string podName, string namespaceName, string errorLogs, string filePath, string fileContent, string? deploymentYaml = null)
+    {
+        try
+        {
+            var systemPrompt = @"You are an expert C# and Kubernetes developer. Your task is to analyze pod errors and generate exact code fixes based on the provided file content.
 You MUST respond with JSON only (no other text). The JSON must have this exact structure:
 {
   ""filePath"": ""src/Services/YourService.cs"",
   ""explanation"": ""Why this fix is needed"",
-  ""originalCode"": ""The buggy code snippet"",
+  ""originalCode"": ""The EXACT buggy code snippet as it appears in the provided file content"",
   ""fixedCode"": ""The corrected code snippet""
 }
 
-Focus on:
-- Environment variable handling
-- Configuration issues
-- Connection/authentication problems
-- Null reference exceptions
-- Resource constraints
-- Deployment misconfigurations";
+CRITICAL: The `originalCode` must match a substring in the provided file exactly, including whitespace and indentation, because it will be used in a string replacement operation. Focus on configuration, connection, null references, resource constraints, etc.";
 
             var userPrompt = $@"Fix the Kubernetes pod error:
 
@@ -91,7 +114,13 @@ Namespace: {namespaceName}
 Error Logs:
 {errorLogs}
 
-{(deploymentYaml != null ? $"Deployment YAML:\n{deploymentYaml}" : "")}
+{(deploymentYaml != null ? $"Deployment YAML:\n{deploymentYaml}\n" : "")}
+Target File Path: {filePath}
+
+Target File Content:
+```csharp
+{fileContent}
+```
 
 Provide the exact C# code fix needed. Return ONLY valid JSON with no markdown formatting.";
 

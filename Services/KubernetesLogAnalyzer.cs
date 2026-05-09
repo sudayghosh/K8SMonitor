@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using k8s;
 using k8s.Models;
 
@@ -68,13 +69,15 @@ public class KubernetesLogAnalyzer
                 name: podName,
                 namespaceParameter: namespaceName,
                 tailLines: tailLines,
-                timestamps: true,
+                timestamps: false,
                 previous: false
             );
 
             var logs = await ReadStreamAsStringAsync(logStream);
             var hasErrors = ContainsErrors(logs);
             var errorLines = ExtractErrorLines(logs);
+
+            var (stackFilePath, stackFileLine) = ExtractFilePathFromStackTrace(logs);
 
             return new PodLogAnalysis
             {
@@ -84,7 +87,9 @@ public class KubernetesLogAnalyzer
                 HasErrors = hasErrors,
                 ErrorLines = errorLines,
                 ErrorCount = errorLines.Count,
-                AnalyzedAt = DateTime.UtcNow
+                AnalyzedAt = DateTime.UtcNow,
+                StackTraceFilePath = stackFilePath,
+                StackTraceFileLine = stackFileLine
             };
         }
         catch (Exception ex)
@@ -138,9 +143,53 @@ public class KubernetesLogAnalyzer
         if (string.IsNullOrEmpty(logs))
             return new List<string>();
 
-        return logs.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None)
-            .Where(line => _errorPatterns.Any(pattern => line.ToLower().Contains(pattern)))
-            .ToList();
+        var lines = logs.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+        var extractedLines = new List<string>();
+        bool capturingStackTrace = false;
+
+        foreach (var line in lines)
+        {
+            if (_errorPatterns.Any(pattern => line.ToLower().Contains(pattern)))
+            {
+                extractedLines.Add(line);
+                capturingStackTrace = true;
+            }
+            else if (capturingStackTrace && (line.StartsWith(" ") || line.StartsWith("\t")))
+            {
+                extractedLines.Add(line);
+            }
+            else
+            {
+                capturingStackTrace = false;
+            }
+        }
+
+        return extractedLines;
+    }
+
+    /// <summary>
+    /// Parses the .NET stack trace format to find the first source file reference.
+    /// Matches lines like: "   at Namespace.Class.Method(...) in /source/Program.cs:line 24"
+    /// </summary>
+    private (string? filePath, int? lineNumber) ExtractFilePathFromStackTrace(string logs)
+    {
+        if (string.IsNullOrEmpty(logs))
+            return (null, null);
+
+        // Matches: "   at ... in <path>:line <number>"
+        var match = Regex.Match(
+            logs,
+            @"\s+at\s+.+\s+in\s+(?<path>[^:]+):line\s+(?<line>\d+)",
+            RegexOptions.Multiline);
+
+        if (match.Success)
+        {
+            var path = match.Groups["path"].Value.Trim();
+            var line = int.Parse(match.Groups["line"].Value);
+            return (path, line);
+        }
+
+        return (null, null);
     }
 
     public async Task<PreviousLogsAnalysis> AnalyzePreviousPodLogsAsync(string podName, string namespaceName = "default")
@@ -210,6 +259,10 @@ public class PodLogAnalysis
     public List<string> ErrorLines { get; set; } = new();
     public int ErrorCount { get; set; }
     public DateTime AnalyzedAt { get; set; }
+    /// <summary>File path extracted from the first stack trace frame (e.g. /source/Program.cs)</summary>
+    public string? StackTraceFilePath { get; set; }
+    /// <summary>Line number extracted from the first stack trace frame</summary>
+    public int? StackTraceFileLine { get; set; }
 }
 
 public class PreviousLogsAnalysis

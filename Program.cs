@@ -1,7 +1,17 @@
-﻿using System.Text;
+using System.Text;
 using k8s;
 using K8SMonitor.Configuration;
 using K8SMonitor.Services;
+
+try
+{
+    var zero = 0;
+    var test = 10 / zero;
+}
+catch (DivideByZeroException ex)
+{
+    Console.WriteLine(ex.ToString());
+}
 
 
 DotNetEnv.Env.Load(); // loads .env from current directory
@@ -115,14 +125,76 @@ try
                 
                 if (!config.DryRun && config.EnableAutoPR)
                 {
-                    Console.WriteLine($"\n⚙️ Generating AI code fix...");
+                    Console.WriteLine($"\n🔍 Identifying buggy file...");
+                    var errorLogsForFix = $"Error Count: {analysis.ErrorCount}\n\nError Lines:\n" + string.Join("\n", analysis.ErrorLines.Take(15));
+
+                    string? filePath = null;
+
+                    // 1. Prefer the file path extracted directly from the stack trace
+                    if (!string.IsNullOrEmpty(analysis.StackTraceFilePath))
+                    {
+                        var stackFileName = System.IO.Path.GetFileName(analysis.StackTraceFilePath);
+                        Console.WriteLine($"  ✓ Stack trace points to: {analysis.StackTraceFilePath} (file: {stackFileName}, line: {analysis.StackTraceFileLine})");
+                        
+                        // Search the repo tree for the exact filename
+                        filePath = await githubPR.SearchFileByNameAsync(stackFileName);
+                        if (filePath != null)
+                            Console.WriteLine($"  ✓ Resolved to repo path: {filePath}");
+                    }
+
+                    // 2. Fall back to AI identification if stack trace didn't yield a result
+                    if (filePath == null)
+                    {
+                        Console.WriteLine("  → Falling back to AI file identification...");
+                        var aiFilePath = await openAI.IdentifyBuggyFileAsync(errorLogsForFix);
+
+                        if (aiFilePath == "unknown")
+                        {
+                            Console.WriteLine("  ⚠️  Could not identify the specific file to fix from the logs.");
+                            continue;
+                        }
+
+                        Console.WriteLine($"  ✓ AI identified file: {aiFilePath}");
+
+                        // Try exact path first, then search by filename
+                        var fileContext2 = await githubPR.GetFileContentAsync(aiFilePath);
+                        if (fileContext2 != null)
+                        {
+                            filePath = aiFilePath;
+                        }
+                        else
+                        {
+                            var fileName = System.IO.Path.GetFileName(aiFilePath);
+                            filePath = await githubPR.SearchFileByNameAsync(fileName);
+                            if (filePath != null)
+                                Console.WriteLine($"  ✓ Resolved AI file to repo path: {filePath}");
+                        }
+                    }
+
+                    if (filePath == null)
+                    {
+                        Console.WriteLine($"  ⚠️  Could not find file in the repository. Skipping auto-fix.");
+                        continue;
+                    }
+
+                    Console.WriteLine($"\n📥 Fetching file context from GitHub: {filePath}");
+                    var fileContext = await githubPR.GetFileContentAsync(filePath);
+
+                    if (fileContext == null)
+                    {
+                        Console.WriteLine($"  ⚠️  Could not fetch file '{filePath}' from the repository. Skipping auto-fix.");
+                        continue;
+                    }
+
+                    Console.WriteLine($"\n⚙️ Generating AI code fix with file context...");
                     
                     // Get AI to generate actual code fix
                     var codeFix = await openAI.GenerateCodeFixAsync(
                         analysis.PodName,
                         ns,
-                        $"Error Count: {analysis.ErrorCount}\n\nError Lines:\n" + 
-                        string.Join("\n", analysis.ErrorLines.Take(15))
+                        errorLogsForFix,
+                        filePath,
+                        fileContext.Content
                     );
                     
                     Console.WriteLine($"✓ Code fix generated:");
@@ -171,3 +243,5 @@ catch (Exception ex)
     Console.WriteLine($"Stack Trace: {ex.StackTrace}");
     Environment.Exit(1);
 }
+
+Console.ReadLine();

@@ -53,7 +53,7 @@ public class GitHubPRService
             // Update file with fixed code
             var updateRequest = new UpdateFileRequest(
                 message: $"Auto-fix: {title}\n\n{codeFix.Explanation}",
-                content: Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(fixedContent)),
+                content: fixedContent,
                 sha: existingFile.Sha,
                 branch: branchName
             );
@@ -100,32 +100,69 @@ public class GitHubPRService
         }
     }
 
-    private class FileContent
+    public class FileContent
     {
         public string Content { get; set; } = string.Empty;
         public string Sha { get; set; } = string.Empty;
+        /// <summary>Resolved full path in the repository (e.g. src/Worker/Program.cs)</summary>
+        public string Path { get; set; } = string.Empty;
     }
 
-    private async Task<FileContent?> GetFileContentAsync(string filePath)
+    public async Task<FileContent?> GetFileContentAsync(string filePath)
     {
         try
         {
             var content = await _client.Repository.Content.GetAllContentsByRef(_owner, _repo, filePath, _baseBranch);
             var file = content.FirstOrDefault();
-            
+
             if (file == null)
                 return null;
 
-            // Decode base64 content
-            var decodedContent = System.Text.Encoding.UTF8.GetString(
-                Convert.FromBase64String(file.Content)
-            );
+            string decodedContent;
+            try
+            {
+                // GitHub wraps base64 with newlines every 60 chars — strip all whitespace before decoding
+                var cleanBase64 = file.Content
+                    .Replace("\n", "")
+                    .Replace("\r", "")
+                    .Replace(" ", "");
+                decodedContent = System.Text.Encoding.UTF8.GetString(
+                    Convert.FromBase64String(cleanBase64)
+                );
+            }
+            catch (FormatException)
+            {
+                // Octokit may have already decoded the content in some versions/configurations
+                decodedContent = file.Content ?? string.Empty;
+            }
 
             return new FileContent
             {
                 Content = decodedContent,
-                Sha = file.Sha
+                Sha = file.Sha,
+                Path = filePath
             };
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  ⚠️  GetFileContentAsync failed for '{filePath}': {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Searches the entire repo tree for a file matching the given filename (e.g. "Program.cs").
+    /// Returns the first full path found (e.g. "src/Worker/Program.cs"), or null if not found.
+    /// </summary>
+    public async Task<string?> SearchFileByNameAsync(string fileName)
+    {
+        try
+        {
+            var tree = await _client.Git.Tree.GetRecursive(_owner, _repo, _baseBranch);
+            var match = tree.Tree.FirstOrDefault(item =>
+                item.Type == TreeType.Blob &&
+                string.Equals(System.IO.Path.GetFileName(item.Path), fileName, StringComparison.OrdinalIgnoreCase));
+            return match?.Path;
         }
         catch
         {
