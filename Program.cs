@@ -115,26 +115,31 @@ try
                 
                 if (!config.DryRun && config.EnableAutoPR)
                 {
-                    // Generate PR title and description
-                    var prInfo = await openAI.GeneratePullRequestTitleAndDescriptionAsync(
+                    Console.WriteLine($"\n⚙️ Generating AI code fix...");
+                    
+                    // Get AI to generate actual code fix
+                    var codeFix = await openAI.GenerateCodeFixAsync(
                         analysis.PodName,
-                        analysis.ErrorLines.First()
+                        ns,
+                        $"Error Count: {analysis.ErrorCount}\n\nError Lines:\n" + 
+                        string.Join("\n", analysis.ErrorLines.Take(15))
                     );
+                    
+                    Console.WriteLine($"✓ Code fix generated:");
+                    Console.WriteLine($"───────────────────────────────────────────────────");
+                    Console.WriteLine($"  File: {codeFix.FilePath}");
+                    Console.WriteLine($"  Reason: {codeFix.Explanation.Substring(0, Math.Min(80, codeFix.Explanation.Length))}...");
                     
                     // Create branch name with timestamp
                     var branchName = $"k8s-fix-{analysis.PodName.ToLower()}-{DateTimeOffset.Now.ToUnixTimeSeconds()}";
                     
-                    // Parse PR info
-                    var (title, description) = ParsePRInfo(prInfo);
-                    
-                    // Create PR
-                    Console.WriteLine($"\n📝 Creating Pull Request...");
-                    var prNumber = await githubPR.CreatePullRequestAsync(
+                    // Create PR with actual code fixes
+                    Console.WriteLine($"\n📝 Applying fix to GitHub repository...");
+                    var prNumber = await githubPR.CreatePullRequestWithCodeFixAsync(
                         branchName,
-                        title,
-                        $"{description}\n\n**Pod:** {analysis.PodName}\n**Namespace:** {ns}\n\n**Errors Found:**\n" + 
-                        string.Join("\n", analysis.ErrorLines.Take(5).Select(e => $"- {e}")),
-                        $"FIXES_K8S_{analysis.PodName}_{DateTimeOffset.Now.ToUnixTimeSeconds()}.md"
+                        $"Auto-fix: {analysis.PodName} - {codeFix.Explanation.Split('\n')[0]}",
+                        $"{aiAnalysis}\n\n**Pod:** `{analysis.PodName}`\n**Namespace:** `{ns}`",
+                        codeFix
                     );
                     
                     prCount++;
@@ -165,28 +170,4 @@ catch (Exception ex)
     Console.WriteLine($"\n✗ FATAL ERROR: {ex.Message}");
     Console.WriteLine($"Stack Trace: {ex.StackTrace}");
     Environment.Exit(1);
-}
-
-/// <summary>
-/// Parse PR info from OpenAI response
-/// </summary>
-static (string Title, string Description) ParsePRInfo(string prInfo)
-{
-    var lines = prInfo.Split('\n');
-    var title = "Auto-fix from K8SMonitor";
-    var description = "AI-generated fix based on pod error analysis";
-    
-    foreach (var line in lines)
-    {
-        if (line.StartsWith("TITLE:", StringComparison.OrdinalIgnoreCase))
-        {
-            title = line.Replace("TITLE:", string.Empty, StringComparison.OrdinalIgnoreCase).Trim();
-        }
-        else if (line.StartsWith("DESCRIPTION:", StringComparison.OrdinalIgnoreCase))
-        {
-            description = line.Replace("DESCRIPTION:", string.Empty, StringComparison.OrdinalIgnoreCase).Trim();
-        }
-    }
-    
-    return (title, description);
 }

@@ -104,8 +104,11 @@ public class KubernetesLogAnalyzer
             {
                 try
                 {
-                    var analysis = await AnalyzePodLogsAsync(pod.Name, namespaceName, tailLines);
-                    analyses.Add(analysis);
+                    if (pod.Name.Contains("worker"))
+                    {
+                        var analysis = await AnalyzePodLogsAsync(pod.Name, namespaceName, tailLines);
+                        analyses.Add(analysis);
+                    }
                 }
                 catch (Exception ex)
                 {
