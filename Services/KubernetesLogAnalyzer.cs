@@ -77,7 +77,8 @@ public class KubernetesLogAnalyzer
             var hasErrors = ContainsErrors(logs);
             var errorLines = ExtractErrorLines(logs);
 
-            var (stackFilePath, stackFileLine) = ExtractFilePathFromStackTrace(logs);
+            // Extract ALL file references from stack traces
+            var stackFileReferences = ExtractAllFilePathsFromStackTrace(logs);
 
             return new PodLogAnalysis
             {
@@ -88,8 +89,9 @@ public class KubernetesLogAnalyzer
                 ErrorLines = errorLines,
                 ErrorCount = errorLines.Count,
                 AnalyzedAt = DateTime.UtcNow,
-                StackTraceFilePath = stackFilePath,
-                StackTraceFileLine = stackFileLine
+                StackTraceFilePath = stackFileReferences.FirstOrDefault()?.FilePath,
+                StackTraceFileLine = stackFileReferences.FirstOrDefault()?.LineNumber,
+                StackTraceFileReferences = stackFileReferences
             };
         }
         catch (Exception ex)
@@ -168,27 +170,51 @@ public class KubernetesLogAnalyzer
     }
 
     /// <summary>
-    /// Parses the .NET stack trace format to find the first source file reference.
+    /// Parses the .NET stack trace format to find ALL source file references.
     /// Matches lines like: "   at Namespace.Class.Method(...) in /source/Program.cs:line 24"
+    /// Returns a list of all unique files found in the error logs.
     /// </summary>
-    private (string? filePath, int? lineNumber) ExtractFilePathFromStackTrace(string logs)
+    private List<StackTraceFileReference> ExtractAllFilePathsFromStackTrace(string logs)
     {
         if (string.IsNullOrEmpty(logs))
-            return (null, null);
+            return new List<StackTraceFileReference>();
+
+        var fileReferences = new List<StackTraceFileReference>();
+        var seenFiles = new HashSet<string>(); // Track unique files to avoid duplicates
 
         // Matches: "   at ... in <path>:line <number>"
-        var match = Regex.Match(
+        var matches = Regex.Matches(
             logs,
             @"\s+at\s+.+\s+in\s+(?<path>[^:]+):line\s+(?<line>\d+)",
             RegexOptions.Multiline);
 
-        if (match.Success)
+        foreach (Match match in matches)
         {
             var path = match.Groups["path"].Value.Trim();
             var line = int.Parse(match.Groups["line"].Value);
-            return (path, line);
+            
+            // Only add if we haven't seen this exact file path before
+            if (!seenFiles.Contains(path))
+            {
+                fileReferences.Add(new StackTraceFileReference { FilePath = path, LineNumber = line });
+                seenFiles.Add(path);
+            }
         }
 
+        return fileReferences;
+    }
+
+    /// <summary>
+    /// Legacy method for backward compatibility - returns the first file reference found.
+    /// </summary>
+    private (string? filePath, int? lineNumber) ExtractFilePathFromStackTrace(string logs)
+    {
+        var references = ExtractAllFilePathsFromStackTrace(logs);
+        if (references.Any())
+        {
+            var first = references.First();
+            return (first.FilePath, first.LineNumber);
+        }
         return (null, null);
     }
 
@@ -259,10 +285,18 @@ public class PodLogAnalysis
     public List<string> ErrorLines { get; set; } = new();
     public int ErrorCount { get; set; }
     public DateTime AnalyzedAt { get; set; }
-    /// <summary>File path extracted from the first stack trace frame (e.g. /source/Program.cs)</summary>
+    /// <summary>File path extracted from the first stack trace frame (e.g. /source/Program.cs) - for backward compatibility</summary>
     public string? StackTraceFilePath { get; set; }
-    /// <summary>Line number extracted from the first stack trace frame</summary>
+    /// <summary>Line number extracted from the first stack trace frame - for backward compatibility</summary>
     public int? StackTraceFileLine { get; set; }
+    /// <summary>All file references found in stack traces (supports multiple files per pod)</summary>
+    public List<StackTraceFileReference> StackTraceFileReferences { get; set; } = new();
+}
+
+public class StackTraceFileReference
+{
+    public string FilePath { get; set; } = string.Empty;
+    public int? LineNumber { get; set; }
 }
 
 public class PreviousLogsAnalysis

@@ -2,16 +2,19 @@ using System.Text;
 using k8s;
 using K8SMonitor.Configuration;
 using K8SMonitor.Services;
+using Worker;
 
-try
-{
-    var zero = 0;
-    var test = 10 / zero;
-}
-catch (DivideByZeroException ex)
-{
-    Console.WriteLine(ex.ToString());
-}
+
+//try
+//{
+//    var connectionString = "Server=your_server;Database=your_database;User Id=your_username;Password=your_password;";
+
+//    var employees = Employee.GetAllEmployees(connectionString);
+//}
+//catch (Exception ex)
+//{
+//    Console.WriteLine(ex.ToString());
+//}
 
 
 DotNetEnv.Env.Load(); // loads .env from current directory
@@ -125,93 +128,127 @@ try
                 
                 if (!config.DryRun && config.EnableAutoPR)
                 {
-                    Console.WriteLine($"\n🔍 Identifying buggy file...");
+                    Console.WriteLine($"\n🔍 Identifying buggy files...");
                     var errorLogsForFix = $"Error Count: {analysis.ErrorCount}\n\nError Lines:\n" + string.Join("\n", analysis.ErrorLines.Take(15));
 
-                    string? filePath = null;
+                    // Get all unique file paths from stack traces
+                    var filePathsToProcess = new List<string>();
 
-                    // 1. Prefer the file path extracted directly from the stack trace
-                    if (!string.IsNullOrEmpty(analysis.StackTraceFilePath))
+                    // 1. Collect file paths from stack trace references
+                    if (analysis.StackTraceFileReferences.Any())
                     {
-                        var stackFileName = System.IO.Path.GetFileName(analysis.StackTraceFilePath);
-                        Console.WriteLine($"  ✓ Stack trace points to: {analysis.StackTraceFilePath} (file: {stackFileName}, line: {analysis.StackTraceFileLine})");
+                        Console.WriteLine($"  Found {analysis.StackTraceFileReferences.Count} file(s) in stack trace:");
                         
-                        // Search the repo tree for the exact filename
-                        filePath = await githubPR.SearchFileByNameAsync(stackFileName);
-                        if (filePath != null)
-                            Console.WriteLine($"  ✓ Resolved to repo path: {filePath}");
+                        foreach (var fileRef in analysis.StackTraceFileReferences)
+                        {
+                            var stackFileName = System.IO.Path.GetFileName(fileRef.FilePath);
+                            Console.WriteLine($"    • {fileRef.FilePath} (line: {fileRef.LineNumber})");
+                            
+                            // Search the repo tree for the exact filename
+                            var resolvedPath = await githubPR.SearchFileByNameAsync(stackFileName);
+                            if (resolvedPath != null)
+                            {
+                                filePathsToProcess.Add(resolvedPath);
+                                Console.WriteLine($"      ✓ Resolved to: {resolvedPath}");
+                            }
+                        }
                     }
 
-                    // 2. Fall back to AI identification if stack trace didn't yield a result
-                    if (filePath == null)
+                    // 2. Fall back to AI identification if stack trace didn't yield results
+                    if (!filePathsToProcess.Any())
                     {
                         Console.WriteLine("  → Falling back to AI file identification...");
                         var aiFilePath = await openAI.IdentifyBuggyFileAsync(errorLogsForFix);
 
-                        if (aiFilePath == "unknown")
+                        if (aiFilePath != "unknown")
                         {
-                            Console.WriteLine("  ⚠️  Could not identify the specific file to fix from the logs.");
-                            continue;
-                        }
+                            Console.WriteLine($"  ✓ AI identified file: {aiFilePath}");
 
-                        Console.WriteLine($"  ✓ AI identified file: {aiFilePath}");
-
-                        // Try exact path first, then search by filename
-                        var fileContext2 = await githubPR.GetFileContentAsync(aiFilePath);
-                        if (fileContext2 != null)
-                        {
-                            filePath = aiFilePath;
+                            // Try exact path first, then search by filename
+                            var fileContext2 = await githubPR.GetFileContentAsync(aiFilePath);
+                            if (fileContext2 != null)
+                            {
+                                filePathsToProcess.Add(aiFilePath);
+                            }
+                            else
+                            {
+                                var fileName = System.IO.Path.GetFileName(aiFilePath);
+                                var resolvedPath = await githubPR.SearchFileByNameAsync(fileName);
+                                if (resolvedPath != null)
+                                {
+                                    filePathsToProcess.Add(resolvedPath);
+                                    Console.WriteLine($"  ✓ Resolved AI file to repo path: {resolvedPath}");
+                                }
+                            }
                         }
                         else
                         {
-                            var fileName = System.IO.Path.GetFileName(aiFilePath);
-                            filePath = await githubPR.SearchFileByNameAsync(fileName);
-                            if (filePath != null)
-                                Console.WriteLine($"  ✓ Resolved AI file to repo path: {filePath}");
+                            Console.WriteLine("  ⚠️  Could not identify any files to fix from the logs.");
                         }
                     }
 
-                    if (filePath == null)
+                    if (!filePathsToProcess.Any())
                     {
-                        Console.WriteLine($"  ⚠️  Could not find file in the repository. Skipping auto-fix.");
+                        Console.WriteLine($"  ⚠️  Could not find any files in the repository. Skipping auto-fix.");
                         continue;
                     }
 
-                    Console.WriteLine($"\n📥 Fetching file context from GitHub: {filePath}");
-                    var fileContext = await githubPR.GetFileContentAsync(filePath);
-
-                    if (fileContext == null)
+                    // Collect all code fixes for all files
+                    var allCodeFixes = new List<CodeFix>();
+                    var filesProcessed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var filePath in filePathsToProcess)
                     {
-                        Console.WriteLine($"  ⚠️  Could not fetch file '{filePath}' from the repository. Skipping auto-fix.");
+                        // Skip if we've already processed this file in this iteration
+                        if (filesProcessed.Contains(filePath))
+                            continue;
+
+                        filesProcessed.Add(filePath);
+
+                        Console.WriteLine($"\n📥 Fetching file context from GitHub: {filePath}");
+                        var fileContext = await githubPR.GetFileContentAsync(filePath);
+
+                        if (fileContext == null)
+                        {
+                            Console.WriteLine($"  ⚠️  Could not fetch file '{filePath}' from the repository. Skipping.");
+                            continue;
+                        }
+
+                        Console.WriteLine($"⚙️ Generating AI code fix with file context...");
+                        
+                        // Get AI to generate actual code fix
+                        var codeFix = await openAI.GenerateCodeFixAsync(
+                            analysis.PodName,
+                            ns,
+                            errorLogsForFix,
+                            filePath,
+                            fileContext.Content
+                        );
+                        
+                        Console.WriteLine($"✓ Code fix generated for: {codeFix.FilePath}");
+                        allCodeFixes.Add(codeFix);
+                    }
+
+                    if (!allCodeFixes.Any())
+                    {
+                        Console.WriteLine($"\n⚠️  Could not generate any fixes for the pod errors. Skipping PR creation.");
                         continue;
                     }
 
-                    Console.WriteLine($"\n⚙️ Generating AI code fix with file context...");
+                    Console.WriteLine($"\n🔀 Generated {allCodeFixes.Count} fix(es) for {filesProcessed.Count} file(s)");
                     
-                    // Get AI to generate actual code fix
-                    var codeFix = await openAI.GenerateCodeFixAsync(
-                        analysis.PodName,
-                        ns,
-                        errorLogsForFix,
-                        filePath,
-                        fileContext.Content
-                    );
-                    
-                    Console.WriteLine($"✓ Code fix generated:");
-                    Console.WriteLine($"───────────────────────────────────────────────────");
-                    Console.WriteLine($"  File: {codeFix.FilePath}");
-                    Console.WriteLine($"  Reason: {codeFix.Explanation.Substring(0, Math.Min(80, codeFix.Explanation.Length))}...");
-                    
-                    // Create branch name with timestamp
+                    // Create ONE branch name with timestamp
                     var branchName = $"k8s-fix-{analysis.PodName.ToLower()}-{DateTimeOffset.Now.ToUnixTimeSeconds()}";
                     
-                    // Create PR with actual code fixes
-                    Console.WriteLine($"\n📝 Applying fix to GitHub repository...");
-                    var prNumber = await githubPR.CreatePullRequestWithCodeFixAsync(
+                    // Create SINGLE PR with all fixes
+                    Console.WriteLine($"\n📝 Creating unified PR with all fixes...");
+                    var filesSection = string.Join(", ", allCodeFixes.Select(f => System.IO.Path.GetFileName(f.FilePath)));
+                    var prTitle = $"Auto-fix: {analysis.PodName} - {filesSection}";
+                    
+                    var prNumber = await githubPR.CreatePullRequestWithMultipleCodeFixesAsync(
                         branchName,
-                        $"Auto-fix: {analysis.PodName} - {codeFix.Explanation.Split('\n')[0]}",
-                        $"{aiAnalysis}\n\n**Pod:** `{analysis.PodName}`\n**Namespace:** `{ns}`",
-                        codeFix
+                        prTitle,
+                        $"{aiAnalysis}\n\n**Pod:** `{analysis.PodName}`\n**Namespace:** `{ns}`\n**Total Fixes:** {allCodeFixes.Count}",
+                        allCodeFixes
                     );
                     
                     prCount++;
@@ -219,7 +256,11 @@ try
                 }
                 else if (config.DryRun)
                 {
-                    Console.WriteLine($"[DRY RUN] Would create PR for {analysis.PodName}");
+                    Console.WriteLine($"[DRY RUN] Would create PR(s) for {analysis.PodName}");
+                    if (analysis.StackTraceFileReferences.Any())
+                    {
+                        Console.WriteLine($"[DRY RUN] Files to process: {string.Join(", ", analysis.StackTraceFileReferences.Select(f => f.FilePath))}");
+                    }
                 }
             }
             catch (Exception ex)
