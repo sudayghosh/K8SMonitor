@@ -1,182 +1,220 @@
 # K8S Monitor - Kubernetes Error Detection & Auto-Fix with AI
 
-A powerful Kubernetes monitoring application that automatically detects pod errors, analyzes them using OpenAI's GPT-4o Mini AI model, and creates pull requests on GitHub with suggested code fixes. This tool helps teams quickly identify and resolve issues in their Kubernetes clusters.
+A .NET 8 console application that scans a Kubernetes cluster for pod errors, asks **OpenAI GPT-4o Mini** to analyze the failure and generate a concrete code fix, then opens a **unified GitHub Pull Request** containing the patch — automatically.
 
-## 🎯 What This Application Does
+> **Status:** Single-run console job. For continuous monitoring it is intended to be deployed as a Kubernetes `CronJob` (manifest included) or run via the included GitHub Actions workflow.
 
-**K8S Monitor** continuously watches your Kubernetes cluster for errors in pod logs. When it detects an error:
+---
 
-1. **Fetches pod logs** from your Kubernetes cluster
-2. **Analyzes errors** using OpenAI's GPT-4o Mini model
-3. **Generates code fixes** with explanations
-4. **Creates pull requests** on GitHub with the suggested solutions
-5. **Manages branches** automatically with smart naming
+## Table of Contents
 
-## ✨ Key Features
+- [What it does](#what-it-does)
+- [How it works](#how-it-works)
+- [Project structure](#project-structure)
+- [Prerequisites](#prerequisites)
+- [Configuration](#configuration)
+- [Build & run](#build--run)
+- [Docker](#docker)
+- [Kubernetes deployment (CronJob)](#kubernetes-deployment-cronjob)
+- [GitHub Actions CI/CD](#github-actions-cicd)
+- [Service reference](#service-reference)
+- [Customization](#customization)
+- [Troubleshooting](#troubleshooting)
+- [Roadmap](#roadmap)
+- [License](#license)
 
-- **🔍 Automatic Error Detection** - Scans pod logs for common error patterns (exceptions, timeouts, crashes, etc.)
-- **🤖 AI-Powered Analysis** - Uses OpenAI GPT-4o Mini to understand root causes and suggest specific code fixes
-- **🌐 Multi-Cluster Support** - Works with Kind, Docker Desktop, AWS EKS, Azure AKS, and any Kubernetes cluster
-- **📝 Auto PR Generation** - Automatically creates GitHub pull requests with detailed fix descriptions
-- **🔄 Multi-Namespace Monitoring** - Monitor errors across multiple Kubernetes namespaces
-- **🎛️ Dry-Run Mode** - Test the system without creating actual pull requests
-- **⚙️ Flexible Configuration** - Easily configure cluster settings, namespaces, and check intervals
+---
 
-## 📋 Prerequisites
+## What it does
 
-Before you get started, make sure you have the following:
+On each run, K8S Monitor:
 
-### Required Software
-- **.NET 8.0 or later** - Download from [dotnet.microsoft.com](https://dotnet.microsoft.com)
-- **Kubernetes Cluster** - You can use:
-  - **Kind** (Kubernetes in Docker) - Great for local development
-  - **Docker Desktop** - Built-in Kubernetes support
-  - **Minikube** - Single-node cluster
-  - **Cloud managed services** - AWS EKS, Azure AKS, Google GKE
-- **kubectl** - Command-line tool configured to access your cluster
-  - Test with: `kubectl get nodes`
+1. **Connects** to the cluster pointed at by your kubeconfig (`%USERPROFILE%\.kube\config` on Windows, `~/.kube/config` elsewhere).
+2. **Enumerates nodes** and reports `Ready` / `NotReady` status.
+3. **Scans pods** in the configured namespaces. By default it processes only pods whose names contain `worker` (see [Customization](#customization)).
+4. **Reads the tail** of each pod's logs (default `50` lines) and matches against an error keyword list.
+5. **Extracts file references** from .NET stack-trace lines (`at … in /source/Program.cs:line 24`) using regex.
+6. **Asks OpenAI** to summarize root cause and generate a structured `CodeFix` (JSON with `filePath`, `originalCode`, `fixedCode`, `explanation`).
+7. **Resolves the file** in the target GitHub repository — first via stack trace, then by searching the repo tree by filename, with an AI fallback (`IdentifyBuggyFileAsync`).
+8. **Opens one PR per affected pod** containing fixes for every affected file on a branch named `k8s-fix-<pod-name>-<unix-timestamp>`.
+9. Supports a **dry-run mode** that performs analysis without modifying the target repository.
 
-### Required Accounts & Keys
-- **OpenAI API Key** - For AI error analysis
-  - Sign up at [platform.openai.com](https://platform.openai.com)
-  - Ensure you have access to GPT-4o Mini model
-- **GitHub Personal Access Token** - For creating pull requests
-  - Go to GitHub → Settings → Developer settings → Personal access tokens
-  - Required scopes: `repo` (full control of private repositories)
+---
 
-## 📦 Installation
+## How it works
 
-### Step 1: Clone the Repository
-```bash
-git clone https://github.com/your-username/K8SMonitor.git
-cd K8SMonitor
+```
+┌──────────────────────────────────────────────────────────────┐
+│                       Program.cs (entry)                     │
+│  Loads .env → builds K8SMonitorConfig → validates → runs     │
+└─────────────────────────────┬────────────────────────────────┘
+                              ↓
+        ┌─────────────────────────────────────────────┐
+        │  KubernetesLogAnalyzer                      │
+        │  • GetNodesAsync                            │
+        │  • GetPodsAsync                             │
+        │  • AnalyzePodLogsAsync                      │
+        │  • AnalyzeAllPodsInNamespaceAsync           │
+        │  • ExtractAllFilePathsFromStackTrace (regex)│
+        └──────────────────────┬──────────────────────┘
+                               ↓
+        ┌─────────────────────────────────────────────┐
+        │  OpenAIService  (gpt-4o-mini)               │
+        │  • AnalyzePodErrorAsync (root cause)        │
+        │  • IdentifyBuggyFileAsync (fallback)        │
+        │  • GenerateCodeFixAsync (JSON CodeFix)      │
+        │  • GeneratePullRequestTitleAndDescription   │
+        └──────────────────────┬──────────────────────┘
+                               ↓
+        ┌─────────────────────────────────────────────┐
+        │  GitHubPRService  (Octokit)                 │
+        │  • GetFileContentAsync                      │
+        │  • SearchFileByNameAsync (recursive tree)   │
+        │  • CreatePullRequestWithMultipleCodeFixes   │
+        │  • CreatePullRequestWithCodeFixAsync        │
+        └─────────────────────────────────────────────┘
 ```
 
-### Step 2: Restore NuGet Dependencies
-```bash
-dotnet restore
+The orchestration in `Program.cs` is:
+
+`scan pods → detect errors → for each erroring pod → resolve files → generate fixes → commit all to one branch → open one PR`.
+
+---
+
+## Project structure
+
+```
+K8SMonitor/
+├── Program.cs                          # Entry point and orchestration
+├── Employee.cs                         # Sample/leftover SQL helper (not used by the monitor)
+├── Configuration/
+│   └── K8SMonitorConfig.cs             # Env-driven config + validation
+├── Services/
+│   ├── KubernetesLogAnalyzer.cs        # K8s API access, log + stack-trace parsing
+│   ├── OpenAIService.cs                # GPT-4o-mini calls, CodeFix DTO
+│   └── GitHubPRService.cs              # Octokit branch/file/PR operations
+├── K8SMonitor.csproj                   # .NET 8, package references
+├── K8SMonitor.sln
+├── Dockerfile                          # Multi-stage build, runtime image
+├── k8s-deployment.yaml                 # ConfigMap, Secret, CronJob, RBAC, Namespace
+├── .github/workflows/k8s-monitor.yml   # CI build + image push + optional run
+├── QUICKSTART.md
+├── DEPLOYMENT.md
+└── README.md                           # This file
 ```
 
-### Step 3: Build the Project
-```bash
-dotnet build
-```
+NuGet packages (`K8SMonitor.csproj`):
 
-### Step 4: Verify Installation
-```bash
-dotnet run --help
-```
+| Package | Version | Purpose |
+|---|---|---|
+| `KubernetesClient` | 19.0.2 | Talk to the cluster API |
+| `OpenAI` | 2.0.0 | GPT-4o-mini chat completions |
+| `Octokit` | 5.0.0 | GitHub REST API client |
+| `DotNetEnv` | 3.2.0 | Load `.env` at startup |
+| `System.Data.SqlClient` | 4.9.1 | Used by `Employee.cs` sample only |
 
-## ⚙️ Configuration
+---
 
-### Environment Variables
+## Prerequisites
 
-The application reads configuration from environment variables. Set these before running:
+- **.NET SDK 8.0+** — <https://dotnet.microsoft.com>
+- **kubectl** with a working context — verify with `kubectl get nodes`
+- A reachable **Kubernetes cluster** (Docker Desktop, Kind, Minikube, EKS, AKS, GKE, …)
+- **OpenAI API key** with access to `gpt-4o-mini` — <https://platform.openai.com/api-keys>
+- **GitHub Personal Access Token (classic)** with the `repo` scope — <https://github.com/settings/tokens>
 
-#### Required Variables
-```bash
-# Your OpenAI API key (used for AI error analysis)
-export OPENAI_API_KEY="sk-..."
+---
 
-# Your GitHub personal access token (used to create PRs)
-export GITHUB_TOKEN="ghp_..."
+## Configuration
 
-# GitHub repository owner (your username or organization name)
-export GITHUB_OWNER="your-username"
+All configuration is read from environment variables (or a `.env` file in the working directory, which is auto-loaded by `DotNetEnv`).
 
-# GitHub repository name (where PRs will be created)
-export GITHUB_REPO="example-voting-app"
-```
+### Required
 
-#### Optional Variables
-```bash
-# Base branch for creating pull requests (default: main)
-export GITHUB_BASE_BRANCH="main"
+| Variable | Description |
+|---|---|
+| `OPENAI_API_KEY` | OpenAI secret key (starts with `sk-`) |
+| `GITHUB_TOKEN`   | GitHub PAT with `repo` scope (starts with `ghp_`) |
 
-# Enable dry-run mode - analyzes errors but doesn't create PRs (default: false)
-export DRY_RUN="false"
+### Optional
 
-# Kubernetes namespace to monitor (default: default)
-# You can monitor multiple namespaces by modifying the code
-export KUBE_NAMESPACE="default"
-```
+| Variable | Default (from `Program.cs`) | Description |
+|---|---|---|
+| `GITHUB_OWNER`       | `sudayghosh`         | Repo owner / org for PRs |
+| `GITHUB_REPO`        | `example-voting-app` | Repo to open PRs against |
+| `GITHUB_BASE_BRANCH` | `main`               | Base branch for PRs |
+| `DRY_RUN`            | `false`              | `true` runs analysis but skips PR creation |
 
-### Configuration Examples
+> Note: `K8SMonitorConfig` exposes additional knobs (`Namespaces`, `TailLines`, `CheckIntervalSeconds`, `EnableAutoPR`, `KubeConfigPath`) but they are not currently wired to env vars — adjust them in code as shown in [Customization](#customization).
 
-#### For Linux/macOS:
-```bash
-export OPENAI_API_KEY="sk-1234567890abcdef"
-export GITHUB_TOKEN="ghp_1234567890abcdef"
-export GITHUB_OWNER="myusername"
-export GITHUB_REPO="my-app"
-export DRY_RUN="false"
-```
+### Example `.env`
 
-#### For Windows PowerShell:
-```powershell
-$env:OPENAI_API_KEY = "sk-1234567890abcdef"
-$env:GITHUB_TOKEN = "ghp_1234567890abcdef"
-$env:GITHUB_OWNER = "myusername"
-$env:GITHUB_REPO = "my-app"
-$env:DRY_RUN = "false"
-```
-
-#### For Windows Command Prompt (cmd.exe):
-```cmd
-set OPENAI_API_KEY=sk-1234567890abcdef
-set GITHUB_TOKEN=ghp_1234567890abcdef
-set GITHUB_OWNER=myusername
-set GITHUB_REPO=my-app
-set DRY_RUN=false
-```
-
-### Using a .env File
-
-Create a `.env` file in the project root directory:
 ```env
-OPENAI_API_KEY=sk-1234567890abcdef
-GITHUB_TOKEN=ghp_1234567890abcdef
-GITHUB_OWNER=myusername
+OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
+GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxx
+GITHUB_OWNER=my-org
 GITHUB_REPO=my-app
 GITHUB_BASE_BRANCH=main
 DRY_RUN=false
 ```
 
-The application will automatically load this file when it starts.
+The project marks `.env` as `CopyToOutputDirectory=Always`, so it is also picked up when running the built binary.
 
-## 🚀 Usage
+### Setting variables manually
 
-### Running the Application
+PowerShell (Windows):
 
-#### 1. Standard Mode (With PR Creation)
-```bash
-dotnet run
-```
-This will:
-- Connect to your Kubernetes cluster
-- Monitor all configured namespaces
-- Detect errors in pod logs
-- Create pull requests for each error found
-
-#### 2. Dry-Run Mode (Without PR Creation)
-```bash
-export DRY_RUN="true"
-dotnet run
-```
-Use this to test the error detection and AI analysis without creating actual pull requests.
-
-#### 3. Run with Custom Configuration
-```bash
-export OPENAI_API_KEY="your-key"
-export GITHUB_TOKEN="your-token"
-export GITHUB_OWNER="owner"
-export GITHUB_REPO="repo"
-dotnet run
+```powershell
+$env:OPENAI_API_KEY = "sk-..."
+$env:GITHUB_TOKEN   = "ghp_..."
+$env:GITHUB_OWNER   = "my-org"
+$env:GITHUB_REPO    = "my-app"
+$env:DRY_RUN        = "false"
 ```
 
-### Understanding the Output
+Bash / Zsh:
 
-When you run the application, you'll see output like this:
+```bash
+export OPENAI_API_KEY="sk-..."
+export GITHUB_TOKEN="ghp_..."
+export GITHUB_OWNER="my-org"
+export GITHUB_REPO="my-app"
+export DRY_RUN="false"
+```
+
+cmd.exe:
+
+```cmd
+set OPENAI_API_KEY=sk-...
+set GITHUB_TOKEN=ghp_...
+set GITHUB_OWNER=my-org
+set GITHUB_REPO=my-app
+set DRY_RUN=false
+```
+
+---
+
+## Build & run
+
+```bash
+git clone https://github.com/<owner>/K8SMonitor.git
+cd K8SMonitor
+
+dotnet restore
+dotnet build
+
+# Recommended for the first run
+$env:DRY_RUN = "true"   # PowerShell
+dotnet run
+
+# Once the output looks correct
+$env:DRY_RUN = "false"
+dotnet run
+```
+
+> The app calls `Console.ReadLine()` at the end of execution, so it stays open after the run when launched from a terminal. Send EOF / press Enter to exit. Remove this line if you want the process to terminate immediately (useful for cron / CI scenarios).
+
+### Sample output
 
 ```
 ╔═══════════════════════════════════════════════════════╗
@@ -188,688 +226,264 @@ When you run the application, you'll see output like this:
 
 📊 CLUSTER INFORMATION
 ═══════════════════════════════════════════════════════
-Nodes: 3
-Namespaces: 2
-Pods with issues: 5
+Nodes: 1
+  • docker-desktop - ✓ Ready
 
-🔍 Analyzing pod errors...
-Pod: api-service-xyz123  | Status: CrashLoopBackOff
-  Error: NullReferenceException in ConnectionPool.cs:45
-  AI Analysis: Connection to database is null...
-  
-  ✓ PR Created: Fix connection pool null reference
-  Branch: fix/null-reference-connectionpool
+🔍 ANALYZING POD LOGS FOR ERRORS
+═══════════════════════════════════════════════════════
 
-📈 Summary
-Total issues found: 5
-Pull requests created: 5
+Scanning namespace: default
+  ⚠️  worker-7f8c9d-abcde: 4 error(s) found
+
+🤖 ANALYZING ERRORS WITH OPENAI GPT-4o Mini
+═══════════════════════════════════════════════════════
+
+[worker-7f8c9d-abcde] Sending error analysis to OpenAI...
+✓ AI Analysis Complete
+
+🔍 Identifying buggy files...
+  Found 2 file(s) in stack trace:
+    • /source/Worker/Program.cs (line: 42)
+      ✓ Resolved to: src/Worker/Program.cs
+
+📥 Fetching file context from GitHub: src/Worker/Program.cs
+⚙️ Generating AI code fix with file context...
+✓ Code fix generated for: src/Worker/Program.cs
+
+🔀 Generated 1 fix(es) for 1 file(s)
+
+📝 Creating unified PR with all fixes...
+✓ Created branch: k8s-fix-worker-7f8c9d-abcde-1716020055
+✓ Fixed file: src/Worker/Program.cs
+✓ Created Pull Request #42 with 1 file fix(es): https://github.com/.../pull/42
+
+📊 Summary: 1 pull request(s) created
+✓ K8S Monitor completed successfully
 ```
 
-### Example: Error Detection Workflow
+---
 
-1. **Error Occurs** - A pod crashes in your cluster
-2. **Detection** - K8S Monitor detects the error in pod logs
-3. **Analysis** - OpenAI GPT-4o Mini analyzes the error and root cause
-4. **Fix Generation** - AI suggests specific code changes
-5. **PR Creation** - A pull request is created on GitHub with:
-   - Title: `fix: [issue description]`
-   - Description: Analysis and solution details
-   - Code: Suggested fix ready to review
-   - Branch: Auto-created feature branch
+## Docker
 
-## 🐳 Docker Usage
+Build:
 
-### Build Docker Image
 ```bash
 docker build -t k8s-monitor:latest .
 ```
 
-### Run in Docker
+Run (mount your kubeconfig read-only):
+
 ```bash
-docker run \
+docker run --rm \
   -e OPENAI_API_KEY="sk-..." \
   -e GITHUB_TOKEN="ghp_..." \
-  -e GITHUB_OWNER="your-username" \
+  -e GITHUB_OWNER="my-org" \
   -e GITHUB_REPO="my-app" \
-  -v ~/.kube/config:/root/.kube/config:ro \
+  -e DRY_RUN="false" \
+  -v $HOME/.kube/config:/root/.kube/config:ro \
   k8s-monitor:latest
 ```
 
-### Push to Container Registry
-```bash
-# GitHub Container Registry
-docker tag k8s-monitor:latest ghcr.io/your-username/k8s-monitor:latest
-docker push ghcr.io/your-username/k8s-monitor:latest
-```
-
-## 🔄 How It Works
-
-The application follows this workflow:
-
-### Step 1: Cluster Connection
-- Connects to your Kubernetes cluster using kubeconfig file
-- Lists all cluster nodes and their status (Ready, NotReady, etc.)
-- Retrieves information about all namespaces being monitored
-
-### Step 2: Pod Log Retrieval
-- Scans all pods in the configured namespaces
-- Reads the last 50 lines of logs from each pod (configurable)
-- Gathers status information (Running, CrashLoopBackOff, Pending, etc.)
-
-### Step 3: Error Detection
-- Searches pod logs for error patterns including:
-  - `error`, `exception`, `failed`, `fatal`
-  - `panic`, `crash`, `timeout`, `deadlock`
-  - `connection refused`, `out of memory`
-  - And more...
-- Extracts error lines and context for analysis
-- Groups errors by pod for batch processing
-
-### Step 4: AI Analysis
-- Sends detected errors to OpenAI GPT-4o Mini API
-- AI analyzes each error and provides:
-  - **Root Cause** - What caused the error
-  - **Analysis** - Why this is a problem
-  - **Solution** - Specific code or configuration fix
-  - **Implementation** - Steps to fix the issue
-
-### Step 5: Pull Request Creation
-- Generates PR title based on AI analysis
-- Creates a new feature branch with pattern: `k8s-fix-<pod-name>-<timestamp>`
-- Commits the suggested fix to the branch
-- Creates pull request on GitHub with:
-  - Detailed description of the error
-  - Root cause analysis from AI
-  - Suggested code changes
-  - Instructions for review and merge
-- Team can review, modify, and merge the PR
-
-### Step 6: Notification
-- Logs successful PR creation
-- Reports summary of all issues found and fixes created
-- In dry-run mode, skips actual PR creation but shows what would happen
-
-## 🏗️ Project Architecture
-
-### Application Flow Diagram
-```
-┌─────────────────────────────────────────────────────┐
-│           Program.cs (Main Entry Point)             │
-│  - Loads configuration from environment variables   │
-│  - Orchestrates the entire monitoring workflow      │
-└─────────────────────────┬───────────────────────────┘
-                          ↓
-        ┌─────────────────────────────────────┐
-        │  KubernetesLogAnalyzer              │
-        │  - Connects to K8s cluster          │
-        │  - Retrieves pod logs               │
-        │  - Detects error patterns           │
-        └──────────┬──────────────────────────┘
-                   ↓
-        ┌──────────────────────────────────────┐
-        │  OpenAIService                       │
-        │  - Sends errors to OpenAI API        │
-        │  - Gets AI analysis and fixes        │
-        │  - Generates PR descriptions         │
-        └──────────┬───────────────────────────┘
-                   ↓
-        ┌──────────────────────────────────────┐
-        │  GitHubPRService                     │
-        │  - Creates feature branches          │
-        │  - Commits fixes to branches         │
-        │  - Creates pull requests on GitHub   │
-        └──────────────────────────────────────┘
-```
-
-### Folder Structure
-```
-K8SMonitor/
-├── Program.cs                 # Entry point - orchestrates workflow
-├── Configuration/
-│   └── K8SMonitorConfig.cs    # Configuration settings and validation
-├── Services/
-│   ├── KubernetesLogAnalyzer.cs  # Kubernetes cluster operations
-│   ├── OpenAIService.cs          # AI error analysis service
-│   └── GitHubPRService.cs        # GitHub PR creation service
-├── K8SMonitor.csproj         # .NET project file with dependencies
-├── Dockerfile                # Container image definition
-├── k8s-deployment.yaml       # Kubernetes deployment manifest
-└── README.md                 # This file
-```
-
-## 🔧 Service Components
-
-### KubernetesLogAnalyzer.cs
-Handles all interactions with your Kubernetes cluster:
-- **GetNodesAsync()** - Retrieves all cluster nodes and their status
-- **GetPodsAsync()** - Lists all pods in a specific namespace
-- **AnalyzePodLogsAsync()** - Reads and analyzes logs from a single pod
-- **AnalyzeAllPodsInNamespaceAsync()** - Batch processes all pods in namespace
-
-Error detection patterns:
-```
-error, exception, failed, fatal, panic, crash, 
-timeout, deadlock, connection refused, out of memory,
-segmentation fault, null reference, undefined
-```
-
-### OpenAIService.cs
-Handles AI-powered error analysis:
-- **AnalyzePodErrorAsync()** - Sends pod errors to OpenAI and gets analysis
-- **GeneratePullRequestTitleAndDescriptionAsync()** - Creates PR title and description
-- Uses OpenAI GPT-4o Mini model for fast, cost-effective analysis
-- Returns structured analysis with root cause and solutions
-
-### GitHubPRService.cs
-Handles all GitHub operations:
-- **GetFileContentAsync()** - Retrieves file content from GitHub
-- **CreatePullRequestWithCodeFixAsync()** - Creates new branch and PR with code fix
-- **UpdateFileAndCreatePullRequestAsync()** - Updates files and creates PR
-- Manages branch naming: `k8s-fix-<pod-name>-<timestamp>`
-- Automatically handles branch creation and PR submission
-
-### K8SMonitorConfig.cs
-Configuration management:
-- Reads all settings from environment variables
-- Validates required configurations at startup
-- Provides defaults for optional settings
-- Contains properties:
-  - `OpenAIApiKey` - API key for error analysis
-  - `GitHubToken` - Token for PR creation
-  - `GitHubOwner` - Repository owner
-  - `GitHubRepo` - Repository name
-  - `GitHubBaseBranch` - Base branch for PRs (default: main)
-  - `Namespaces` - Kubernetes namespaces to monitor
-  - `TailLines` - Number of log lines to read (default: 50)
-  - `CheckIntervalSeconds` - Monitoring interval (default: 300)
-  - `DryRun` - Test mode without creating actual PRs
-
-## 🌿 Branch Naming Convention
-
-Auto-generated branches follow this pattern:
-```
-k8s-fix-<pod-name>-<unix-timestamp>
-```
-
-**Examples:**
-- `k8s-fix-voting-app-1705314645` - Fix for voting-app pod
-- `k8s-fix-api-service-1705314700` - Fix for api-service pod
-- `k8s-fix-database-1705314755` - Fix for database pod
-
-**Why timestamps?**
-- Prevents branch name collisions
-- Creates unique branches for each error detection
-- Allows tracking when the error was detected
-
-## 📚 Getting API Keys
-
-### OpenAI API Key
-
-1. Visit https://platform.openai.com/signup
-2. Sign up for OpenAI account
-3. Navigate to https://platform.openai.com/api-keys
-4. Click "Create new secret key"
-5. Copy the key (starts with `sk-`)
-6. **Important:** Save it securely - you won't be able to see it again
-7. Store in your environment variable: `OPENAI_API_KEY`
-
-### GitHub Personal Access Token
-
-1. Go to GitHub.com and log in
-2. Click your profile icon (top right) → Settings
-3. In left sidebar: Developer settings → Personal access tokens
-4. Choose "Tokens (classic)" for broader access
-5. Click "Generate new token"
-6. Set these permissions:
-   - ✅ `repo` - Full control of private repositories
-   - ✅ `gist` (optional) - Create gists
-7. Choose expiration (or "No expiration" for personal use)
-8. Click "Generate token"
-9. Copy the token (starts with `ghp_`)
-10. **Important:** Save it securely - you won't be able to see it again
-11. Store in your environment variable: `GITHUB_TOKEN`
-
-## 🚀 Quick Start Example
+Push to GHCR:
 
 ```bash
-# Step 1: Set environment variables
-export OPENAI_API_KEY="sk-1234567890abcdef"
-export GITHUB_TOKEN="ghp_1234567890abcdef"
-export GITHUB_OWNER="my-username"
-export GITHUB_REPO="my-app"
-
-# Step 2: Build the application
-dotnet build
-
-# Step 3: Test with dry-run mode first (no PRs created)
-export DRY_RUN="true"
-dotnet run
-
-# Step 4: If everything looks good, run for real
-export DRY_RUN="false"
-dotnet run
-
-# Step 5: Check GitHub for new pull requests
-# Navigate to https://github.com/my-username/my-app/pulls
+docker tag k8s-monitor:latest ghcr.io/<owner>/k8s-monitor:latest
+docker push ghcr.io/<owner>/k8s-monitor:latest
 ```
+
+The Dockerfile uses a `dotnet/sdk:8.0` build stage and `dotnet/runtime:8.0` runtime stage, installs `curl`, sets `DRY_RUN=false`, and exposes a basic `HEALTHCHECK`.
+
+---
+
+## Kubernetes deployment (CronJob)
+
+`k8s-deployment.yaml` provisions:
+
+- A `monitoring` namespace
+- A `ConfigMap` (`k8s-monitor-config`) with `TAIL_LINES`, `CHECK_INTERVAL_SECONDS`, `NAMESPACES`
+- A `Secret` (`k8s-monitor-secrets`) with `OPENAI_API_KEY`, `GITHUB_TOKEN`, `GITHUB_OWNER`, `GITHUB_REPO`
+- A `ServiceAccount` + `ClusterRole` + `ClusterRoleBinding` granting read access to nodes, pods, pod logs, and events
+- A `CronJob` (`k8s-monitor`) that runs every 5 minutes (`*/5 * * * *`) with resource requests/limits and a non-privileged security context
+
+Deploy:
 
 ```bash
-# 1. Set up environment
-export OPENAI_API_KEY="sk-..."
-export GITHUB_TOKEN="ghp_..."
-export GITHUB_OWNER="octocat"
-export GITHUB_REPO="Hello-World"
+# Edit secrets and image reference first
+kubectl apply -f k8s-deployment.yaml
 
-# 2. Run monitor
-dotnet run
+kubectl get cronjobs -n monitoring
+kubectl describe cronjob k8s-monitor -n monitoring
 
-# 3. Check GitHub for new PRs
-# Navigate to https://github.com/octocat/Hello-World/pulls
+# Trigger an ad-hoc run
+kubectl create job --from=cronjob/k8s-monitor test-run -n monitoring
+kubectl logs -n monitoring job/test-run -f
 ```
 
-## 🆘 Troubleshooting
+See `DEPLOYMENT.md` for the full guide.
 
-### Configuration Errors
+---
 
-#### "OPENAI_API_KEY environment variable is required"
-**Cause:** The OpenAI API key environment variable is not set.
+## GitHub Actions CI/CD
 
-**Solutions:**
-```bash
-# Check if the variable is set
-echo $OPENAI_API_KEY  # Linux/macOS
-echo $env:OPENAI_API_KEY  # PowerShell
+`.github/workflows/k8s-monitor.yml`:
 
-# Set it if missing
-export OPENAI_API_KEY="sk-your-key-here"  # Linux/macOS
-$env:OPENAI_API_KEY = "sk-your-key-here"  # PowerShell
+- Triggered on push to `main` / `example-voting-app`, on PRs to `main`, and via `workflow_dispatch`
+- Restores, builds, tests, and publishes the .NET project
+- Logs into `ghcr.io` and pushes a multi-tag Docker image (branch, semver, sha) on non-PR events
+- Has an optional `deploy-k8s-monitor` job that runs `dotnet run` against the cluster on pushes to the `example-voting-app` branch, using `OPENAI_API_KEY` and `GITHUB_TOKEN` repository secrets
 
-# Or use a .env file
-echo "OPENAI_API_KEY=sk-your-key-here" > .env
+---
+
+## Service reference
+
+### `K8SMonitorConfig` (`Configuration/K8SMonitorConfig.cs`)
+
+| Property | Type | Default | Notes |
+|---|---|---|---|
+| `KubeConfigPath` | `string` | `%USERPROFILE%\.kube\config` | Not currently read by `Program.cs` (uses `BuildConfigFromConfigFile()` default) |
+| `OpenAIApiKey` | `string` | `OPENAI_API_KEY` env | Required |
+| `GitHubToken` | `string` | `GITHUB_TOKEN` env | Required |
+| `GitHubOwner` | `string` | `your-username` / `sudayghosh` | Override via env |
+| `GitHubRepo` | `string` | `example-voting-app` | Override via env |
+| `GitHubBaseBranch` | `string` | `main` | |
+| `Namespaces` | `string[]` | `["default"]` | Edit in code to monitor others |
+| `TailLines` | `int` | `50` | Log lines per pod |
+| `CheckIntervalSeconds` | `int` | `300` | Reserved for future polling loop |
+| `EnableAutoPR` | `bool` | `true` | Set `false` to suppress PR creation |
+| `DryRun` | `bool` | `false` | `DRY_RUN=true` to skip PRs |
+
+`Validate()` throws if `OPENAI_API_KEY` or `GITHUB_TOKEN` are missing.
+
+### `KubernetesLogAnalyzer`
+
+- `GetNodesAsync()` — list nodes with `Ready` status.
+- `GetPodsAsync(namespace)` — list pods with restart counts.
+- `AnalyzePodLogsAsync(pod, namespace, tailLines)` — fetch tail logs, scan for error keywords, extract stack-trace file references.
+- `AnalyzeAllPodsInNamespaceAsync(namespace, tailLines)` — **currently filters pods whose name contains `worker`** (see code, line ~114). Remove or change this guard to scan more.
+- Error keywords: `error, exception, failed, fatal, panic, crash, timeout, deadlock, connection refused, out of memory, segmentation fault, null reference, undefined`.
+- Stack-trace extraction regex: `\s+at\s+.+\s+in\s+(?<path>[^:]+):line\s+(?<line>\d+)`.
+
+### `OpenAIService` (model: `gpt-4o-mini`)
+
+- `AnalyzePodErrorAsync(pod, ns, logs)` — natural-language root cause + fix suggestion.
+- `IdentifyBuggyFileAsync(errorLogs)` — returns a single file path string (or `"unknown"`).
+- `GenerateCodeFixAsync(pod, ns, errorLogs, filePath, fileContent, deploymentYaml?)` — returns a `CodeFix { FilePath, OriginalCode, FixedCode, Explanation }` parsed from JSON.
+- `GeneratePullRequestTitleAndDescriptionAsync(pod, errorSummary)` — convenience helper.
+
+### `GitHubPRService` (Octokit)
+
+- `GetFileContentAsync(path)` — fetch and base64-decode file content + SHA from the base branch.
+- `SearchFileByNameAsync(fileName)` — walks the recursive Git tree to find a file by name.
+- `CreatePullRequestWithMultipleCodeFixesAsync(branch, title, description, codeFixes)` — creates a branch off the base, applies every `CodeFix` via `string.Replace(OriginalCode, FixedCode)`, commits each file, and opens a single PR with a rich body listing every change.
+- `CreatePullRequestWithCodeFixAsync(...)` — single-file variant.
+- `CreatePullRequestAsync(branch, title, description, fileName, fileContent)` — generic create-or-update helper (used when shipping a free-form file).
+
+Branch name format produced by `Program.cs`:
+
+```
+k8s-fix-<pod-name-lowercase>-<unix-timestamp>
 ```
 
-#### "GITHUB_TOKEN environment variable is required"
-**Cause:** The GitHub token environment variable is not set.
+PR title format:
 
-**Solutions:**
-- Create a new GitHub token (see Getting API Keys section)
-- Set the environment variable before running:
-  ```bash
-  export GITHUB_TOKEN="ghp_your-token-here"
-  ```
-
-### Kubernetes Connection Issues
-
-#### "Failed to connect to Kubernetes cluster"
-**Cause:** Kubeconfig not found or cluster is unreachable.
-
-**Solutions:**
-```bash
-# Verify kubeconfig exists
-ls ~/.kube/config  # Linux/macOS
-dir %USERPROFILE%\.kube\config  # Windows
-
-# Check cluster access
-kubectl cluster-info
-kubectl get nodes
-
-# If using Docker Desktop, ensure Kubernetes is enabled
-# Docker Desktop → Settings → Kubernetes → Enable Kubernetes
+```
+Auto-fix: <pod-name> - <file1>, <file2>, ...
 ```
 
-#### "Connection refused" or "Unable to reach server"
-**Cause:** Kubernetes cluster is not running or kubeconfig points to wrong cluster.
+---
 
-**Solutions:**
-```bash
-# View all configured clusters
-kubectl config view
+## Customization
 
-# Switch to correct cluster
-kubectl config use-context docker-desktop  # or your cluster name
+Open the file, change the value, rebuild.
 
-# Test connection
-kubectl get nodes
-```
-
-### GitHub Issues
-
-#### "Failed to create pull request" or "404 Repository not found"
-**Cause:** Repository name is wrong, token doesn't have permissions, or repository doesn't exist.
-
-**Solutions:**
-- Verify repository exists and you have access
-- Check environment variables:
-  ```bash
-  echo $GITHUB_OWNER  # Should be username or organization
-  echo $GITHUB_REPO   # Should be exact repository name
-  ```
-- Create a new token with full `repo` scope
-- Verify the token is not expired
-
-#### "403 Forbidden" or "Insufficient permissions"
-**Cause:** GitHub token doesn't have required permissions.
-
-**Solutions:**
-- Create a new token with `repo` scope enabled
-- Check that token hasn't expired
-- Verify token has write access to the repository
-
-### API & Cost Issues
-
-#### "Rate limit exceeded" from OpenAI
-**Cause:** Too many API calls hitting OpenAI's rate limits.
-
-**Solutions:**
-- Wait before running again (limits reset periodically)
-- Check your OpenAI usage at https://platform.openai.com/usage
-- Consider using batch mode for large clusters
-
-#### "Unexpected AI response" or "JSON parse error"
-**Cause:** OpenAI API format changed or unexpected response.
-
-**Solutions:**
-- Check that GPT-4o Mini model is available in your account
-- Verify OpenAI API key is valid
-- Ensure OpenAI account has credits
-- Try running with `DRY_RUN=true` first
-
-### No Errors Found
-
-#### "No errors detected in any pods"
-**This is actually good!** It means your cluster is healthy.
-
-**If you expect errors:**
-- Increase `TailLines` in config to read more log history
-- Check if pods are actually running:
-  ```bash
-  kubectl get pods
-  kubectl logs <pod-name>
-  ```
-- Verify you're monitoring the right namespaces:
-  ```bash
-  kubectl get namespaces
-  kubectl get pods -n <namespace-name>
-  ```
-
-### Performance Issues
-
-#### "Application runs very slowly"
-**Cause:** Too many pods, reading too many logs, or network latency.
-
-**Solutions:**
-- Reduce `TailLines` (default: 50)
-- Monitor specific namespaces instead of all
-- Run in dry-run mode for testing
-- Check network connectivity to cluster and APIs
-
-#### "Out of memory" error
-**Cause:** Processing too many pod logs at once.
-
-**Solutions:**
-- Reduce the number of namespaces monitored
-- Decrease `TailLines` value
-- Run on a machine with more memory
-
-## ⚡ Advanced Configuration
-
-### Monitoring Multiple Namespaces
-
-Edit `Program.cs` to monitor specific namespaces:
+**Monitor different namespaces** (`Program.cs` / `K8SMonitorConfig.cs`):
 
 ```csharp
 var config = new K8SMonitorConfig
 {
-    // ... other configuration ...
     Namespaces = new[] { "production", "staging", "monitoring" }
 };
 ```
 
-### Adding Custom Error Patterns
+**Scan all pods, not just `worker-*`** (`Services/KubernetesLogAnalyzer.cs`, `AnalyzeAllPodsInNamespaceAsync`):
 
-Edit `Services/KubernetesLogAnalyzer.cs`:
+```csharp
+foreach (var pod in pods)
+{
+    var analysis = await AnalyzePodLogsAsync(pod.Name, namespaceName, tailLines);
+    analyses.Add(analysis);
+}
+```
+
+**Add custom error patterns** (`Services/KubernetesLogAnalyzer.cs`):
 
 ```csharp
 private readonly string[] _errorPatterns = new[]
 {
     "error", "exception", "failed", "fatal",
     "panic", "crash", "timeout", "deadlock",
-    "connection refused", "out of memory",
-    "segmentation fault", "null reference",
-    "YOUR_CUSTOM_ERROR",  // Add custom patterns
-    "ANOTHER_ERROR_TYPE"
+    "your-custom-token"
 };
 ```
 
-### Changing AI Model
-
-Edit `Services/OpenAIService.cs`:
+**Change AI model** (`Services/OpenAIService.cs`):
 
 ```csharp
-public OpenAIService(string apiKey)
-{
-    _apiKey = apiKey ?? throw new ArgumentNullException(nameof(apiKey));
-    _client = new ChatClient("gpt-4", _apiKey);  // Change from gpt-4o-mini to gpt-4
-}
+_client = new ChatClient("gpt-4o", _apiKey); // or "gpt-4", "gpt-3.5-turbo"
 ```
 
-Available models:
-- `gpt-4o-mini` - Fast, cost-effective (default)
-- `gpt-4` - More powerful analysis
-- `gpt-3.5-turbo` - Older but cheaper
-
-### Adjusting Log Tail Lines
-
-Change how many log lines are read from each pod:
+**Increase log context** (`K8SMonitorConfig.cs`):
 
 ```csharp
-var config = new K8SMonitorConfig
-{
-    // ... other configuration ...
-    TailLines = 100  // Read more lines (default: 50)
-};
+public int TailLines { get; set; } = 200;
 ```
 
-### Modifying Check Interval
-
-Change how frequently the monitor checks for errors:
+**Disable PR creation** (`K8SMonitorConfig.cs`):
 
 ```csharp
-var config = new K8SMonitorConfig
-{
-    // ... other configuration ...
-    CheckIntervalSeconds = 600  // Check every 10 minutes (default: 300)
-};
+public bool EnableAutoPR { get; set; } = false;
 ```
-
-### Disabling Auto-PR Creation
-
-Test without creating pull requests:
-
-```csharp
-var config = new K8SMonitorConfig
-{
-    // ... other configuration ...
-    EnableAutoPR = false  // Analyze but don't create PRs
-};
-```
-
-## 📖 API Reference
-
-### Environment Variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `OPENAI_API_KEY` | ✅ Yes | - | OpenAI API secret key (starts with `sk-`) |
-| `GITHUB_TOKEN` | ✅ Yes | - | GitHub personal access token (starts with `ghp_`) |
-| `GITHUB_OWNER` | ✅ Yes | - | GitHub repository owner or organization name |
-| `GITHUB_REPO` | ✅ Yes | - | GitHub repository name (exact match required) |
-| `GITHUB_BASE_BRANCH` | No | `main` | Base branch for creating pull requests |
-| `DRY_RUN` | No | `false` | Set to `true` to analyze without creating PRs |
-| `KUBE_NAMESPACE` | No | `default` | Kubernetes namespace to monitor |
-
-### Configuration Properties
-
-The `K8SMonitorConfig` class contains:
-
-| Property | Type | Default | Purpose |
-|----------|------|---------|---------|
-| `KubeConfigPath` | string | `~/.kube/config` | Path to kubeconfig file |
-| `OpenAIApiKey` | string | - | OpenAI API key from environment |
-| `GitHubToken` | string | - | GitHub token from environment |
-| `GitHubOwner` | string | `sudayghosh` | Repository owner |
-| `GitHubRepo` | string | `example-voting-app` | Repository name |
-| `GitHubBaseBranch` | string | `main` | Base branch for PRs |
-| `Namespaces` | string[] | `["default"]` | Namespaces to monitor |
-| `TailLines` | int | `50` | Number of log lines to read |
-| `CheckIntervalSeconds` | int | `300` | Seconds between checks |
-| `EnableAutoPR` | bool | `true` | Enable PR creation |
-| `DryRun` | bool | `false` | Test mode without PRs |
-
-## ⚡ Performance Considerations
-
-### Log Processing
-- **Default:** Reads last 50 lines per pod
-- **Impact:** Increase `TailLines` for more context, but may slow analysis
-- **Recommendation:** Start with 50, adjust based on your needs
-
-### Batch Processing
-- **Current:** Analyzes all pods sequentially
-- **Impact:** Large clusters may take several minutes
-- **Optimization:** Monitor specific namespaces instead of all
-
-### API Costs
-- **OpenAI:** Each error analysis costs ~$0.001 USD (very low with GPT-4o Mini)
-- **GitHub:** Pull request creation is free
-- **Estimated:** $0.10-1.00 USD per 1000 error analyses
-
-### Rate Limiting
-- **OpenAI:** Limits vary by plan (typically 3,500 RPM for free tier)
-- **GitHub:** 5,000 requests/hour per user
-- **Solution:** Implement longer `CheckIntervalSeconds` if hitting limits
-
-### Network Performance
-- **Cluster latency:** Reading logs depends on cluster network speed
-- **API latency:** OpenAI and GitHub API calls add 1-3 seconds each
-- **Optimization:** Run locally or in same cloud region as cluster
-
-## 🤝 Contributing
-
-We welcome contributions! Here's how to help:
-
-### Development Workflow
-
-1. **Fork the repository**
-   ```bash
-   # On GitHub, click "Fork" button
-   git clone https://github.com/YOUR-USERNAME/K8SMonitor.git
-   cd K8SMonitor
-   ```
-
-2. **Create a feature branch**
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
-
-3. **Make your changes**
-   - Keep commits small and focused
-   - Write clear commit messages
-   - Test your changes
-
-4. **Commit your work**
-   ```bash
-   git commit -am 'Add: Your feature description'
-   ```
-
-5. **Push to your fork**
-   ```bash
-   git push origin feature/your-feature-name
-   ```
-
-6. **Submit a Pull Request**
-   - On GitHub, click "Compare & pull request"
-   - Provide a clear description of changes
-   - Link any related issues
-
-### Development Guidelines
-
-- **Code style:** Follow C# conventions
-- **Naming:** Use clear, descriptive names
-- **Comments:** Document complex logic
-- **Testing:** Test locally before submitting PR
-- **Documentation:** Update README if adding features
-
-## 📄 License
-
-This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
-
-This means:
-- ✅ You can use this in commercial projects
-- ✅ You can modify and distribute the code
-- ✅ You must include the license with distributions
-- ❌ No warranty or liability
-
-## 💬 Support & Questions
-
-### Getting Help
-
-1. **Check the FAQ** - Most common issues are documented in Troubleshooting
-2. **Search existing issues** - Your question might already be answered
-3. **Read the code** - Comments explain complex sections
-4. **Check logs** - Run with `-v` for verbose output (if supported)
-
-### Reporting Issues
-
-1. **Describe the problem** - What were you trying to do?
-2. **Include error message** - Copy the full error text
-3. **Provide environment** - OS, .NET version, K8s version
-4. **Share config** - Environment variables (without secrets!)
-5. **Steps to reproduce** - Exact commands to replicate the issue
-
-### Feature Requests
-
-1. **Describe the feature** - What should it do?
-2. **Explain the use case** - Why do you need it?
-3. **Provide examples** - How would you use it?
-
-## 🚀 Roadmap
-
-Planned features and improvements:
-
-### Short Term (Next Release)
-- [ ] **Persistent Error Tracking** - Track errors over time with historical data
-- [ ] **Error Trending Dashboard** - Visualize error patterns and frequency
-- [ ] **Slack Integration** - Send notifications to Slack channels
-- [ ] **Custom Fix Templates** - Create templates for common error types
-
-### Medium Term (Future Releases)
-- [ ] **Scheduled Monitoring** - Cron-like scheduling for checks
-- [ ] **Email Notifications** - Email alerts for critical errors
-- [ ] **PR Review Workflow** - Automatic approval of low-risk PRs
-- [ ] **Multiple AI Models** - Support for other AI providers (Claude, LLaMA, etc.)
-- [ ] **Metrics Export** - Prometheus-compatible metrics
-
-### Long Term (Future Versions)
-- [ ] **Web Dashboard** - Real-time monitoring UI
-- [ ] **Multi-Cluster Support** - Monitor multiple clusters simultaneously
-- [ ] **Advanced Analytics** - ML-powered error prediction
-- [ ] **ChatOps Integration** - Control via chat commands
-- [ ] **API Endpoints** - REST API for integration
-
-## 📊 Project Statistics
-
-- **Language:** C# (.NET 8.0)
-- **License:** MIT
-- **Main Dependencies:**
-  - KubernetesClient (K8s API)
-  - OpenAI (AI integration)
-  - Octokit (GitHub API)
-  - DotNetEnv (.env support)
 
 ---
 
-## 🙏 Acknowledgments
+## Troubleshooting
 
-- Built with ❤️ for the Kubernetes community
-- Thanks to all contributors and supporters
-- Powered by .NET, OpenAI, and GitHub APIs
+**`OPENAI_API_KEY environment variable is required` / `GITHUB_TOKEN environment variable is required`**
+Set the variable in your shell or place it in `.env`. `Validate()` runs before any work is performed.
+
+**`Failed to connect to Kubernetes cluster`**
+Make sure `kubectl get nodes` succeeds from the same shell. The app uses `KubernetesClientConfiguration.BuildConfigFromConfigFile()` and respects `KUBECONFIG`.
+
+**`Code fix could not be applied — original code not found in file`**
+The AI's `originalCode` did not match a substring in the file (whitespace mismatch, stale content, etc.). The fix is skipped; rerun or refine the prompt in `OpenAIService.GenerateCodeFixAsync`.
+
+**`Could not find file: <path>` during PR creation**
+The resolved path does not exist on the base branch of the target repo. Confirm `GITHUB_OWNER`, `GITHUB_REPO`, and `GITHUB_BASE_BRANCH`, and verify the file exists with the same casing.
+
+**`Rate limit exceeded` from OpenAI**
+Lower the volume of erroring pods per run or upgrade your OpenAI plan; consider increasing the CronJob interval.
+
+**`404 Repository not found` / `403 Forbidden` from GitHub**
+The PAT does not have `repo` scope, has expired, or lacks access to the target repository.
+
+**No pods are analyzed**
+By default `AnalyzeAllPodsInNamespaceAsync` only inspects pods whose names contain `worker`. Remove that filter to scan everything (see [Customization](#customization)).
+
+---
+
+## Roadmap
+
+- Wire `Namespaces`, `TailLines`, `CheckIntervalSeconds` to env vars
+- Continuous monitoring loop (today: single-shot per execution)
+- Persistent error history + dedupe to avoid duplicate PRs
+- Slack / Teams / email notifications
+- Pluggable LLM providers (Anthropic, local models)
+- Prometheus metrics export
+- Web dashboard
+- Multi-cluster support
+
+---
+
+## License
+
+MIT — see `LICENSE` if present.
