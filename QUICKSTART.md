@@ -20,6 +20,17 @@ $env:GITHUB_OWNER = "your-github-username"
 $env:GITHUB_REPO = "example-voting-app"
 $env:GITHUB_BASE_BRANCH = "main"
 $env:DRY_RUN = "false"
+
+# Optional: email notifications when a PR is created
+$env:EMAIL_ENABLED = "true"
+$env:SMTP_HOST = "smtp.gmail.com"
+$env:SMTP_PORT = "587"
+$env:SMTP_USER = "you@example.com"
+$env:SMTP_PASSWORD = "your-app-password"
+$env:SMTP_USE_SSL = "true"
+$env:EMAIL_FROM = "you@example.com"
+$env:EMAIL_FROM_NAME = "K8S Monitor"
+$env:PR_NOTIFY_EMAILS = "dev1@example.com,dev2@example.com"
 ```
 
 #### Bash/Zsh (Linux/Mac):
@@ -30,6 +41,17 @@ export GITHUB_OWNER="your-github-username"
 export GITHUB_REPO="example-voting-app"
 export GITHUB_BASE_BRANCH="main"
 export DRY_RUN="false"
+
+# Optional: email notifications when a PR is created
+export EMAIL_ENABLED="true"
+export SMTP_HOST="smtp.gmail.com"
+export SMTP_PORT="587"
+export SMTP_USER="you@example.com"
+export SMTP_PASSWORD="your-app-password"
+export SMTP_USE_SSL="true"
+export EMAIL_FROM="you@example.com"
+export EMAIL_FROM_NAME="K8S Monitor"
+export PR_NOTIFY_EMAILS="dev1@example.com,dev2@example.com"
 ```
 
 #### Windows Command Prompt:

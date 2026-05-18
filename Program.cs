@@ -26,7 +26,8 @@ var config = new K8SMonitorConfig
     GitHubOwner = Environment.GetEnvironmentVariable("GITHUB_OWNER") ?? "sudayghosh",
     GitHubRepo = Environment.GetEnvironmentVariable("GITHUB_REPO") ?? "example-voting-app",
     GitHubBaseBranch = Environment.GetEnvironmentVariable("GITHUB_BASE_BRANCH") ?? "main",
-    DryRun = Environment.GetEnvironmentVariable("DRY_RUN")?.ToLower() == "true"
+    DryRun = Environment.GetEnvironmentVariable("DRY_RUN")?.ToLower() == "true",
+    // Email notification settings come from environment variables - see K8SMonitorConfig defaults
 };
 
 config.Validate();
@@ -45,6 +46,12 @@ try
     var analyzer = new KubernetesLogAnalyzer(kubeClient);
     var openAI = new OpenAIService(config.OpenAIApiKey);
     var githubPR = new GitHubPRService(config.GitHubToken, config.GitHubOwner, config.GitHubRepo, config.GitHubBaseBranch);
+    var emailService = new EmailService(config);
+
+    if (config.EmailEnabled)
+    {
+        Console.WriteLine($"✉️  Email notifications enabled - recipients: {string.Join(", ", config.PrNotifyEmails)}");
+    }
 
     // Get cluster information
     Console.WriteLine("✓ Connected to cluster\n");
@@ -244,7 +251,7 @@ try
                     var filesSection = string.Join(", ", allCodeFixes.Select(f => System.IO.Path.GetFileName(f.FilePath)));
                     var prTitle = $"Auto-fix: {analysis.PodName} - {filesSection}";
                     
-                    var prNumber = await githubPR.CreatePullRequestWithMultipleCodeFixesAsync(
+                    var prResult = await githubPR.CreatePullRequestWithMultipleCodeFixesAsync(
                         branchName,
                         prTitle,
                         $"{aiAnalysis}\n\n**Pod:** `{analysis.PodName}`\n**Namespace:** `{ns}`\n**Total Fixes:** {allCodeFixes.Count}",
@@ -252,7 +259,18 @@ try
                     );
                     
                     prCount++;
-                    Console.WriteLine($"✓ Pull Request created: #{prNumber}");
+                    Console.WriteLine($"✓ Pull Request created: #{prResult.Number}");
+
+                    // Notify configured recipients about the new PR
+                    await emailService.SendPullRequestCreatedAsync(
+                        prNumber: prResult.Number,
+                        prUrl: prResult.HtmlUrl,
+                        prTitle: prResult.Title,
+                        podName: analysis.PodName,
+                        @namespace: ns,
+                        filesModified: prResult.FilesModified,
+                        aiSummary: aiAnalysis
+                    );
                 }
                 else if (config.DryRun)
                 {

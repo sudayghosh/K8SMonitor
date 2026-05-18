@@ -22,10 +22,22 @@ public class GitHubPRService
     }
 
     /// <summary>
+    /// Result of creating a pull request - includes everything needed to notify
+    /// downstream consumers (e.g. email service) about the newly opened PR.
+    /// </summary>
+    public class PullRequestResult
+    {
+        public int Number { get; set; }
+        public string HtmlUrl { get; set; } = string.Empty;
+        public string Title { get; set; } = string.Empty;
+        public List<string> FilesModified { get; set; } = new();
+    }
+
+    /// <summary>
     /// Creates a single PR with fixes for multiple files from a pod error.
     /// All fixes are applied to the same branch and included in one PR.
     /// </summary>
-    public async Task<int> CreatePullRequestWithMultipleCodeFixesAsync(string branchName, string title, string description, List<CodeFix> codeFixes)
+    public async Task<PullRequestResult> CreatePullRequestWithMultipleCodeFixesAsync(string branchName, string title, string description, List<CodeFix> codeFixes)
     {
         try
         {
@@ -116,7 +128,13 @@ public class GitHubPRService
             var pr = await _client.PullRequest.Create(_owner, _repo, prRequest);
             Console.WriteLine($"✓ Created Pull Request #{pr.Number} with {appliedFixes.Count} file fix(es): {pr.HtmlUrl}");
 
-            return pr.Number;
+            return new PullRequestResult
+            {
+                Number = pr.Number,
+                HtmlUrl = pr.HtmlUrl,
+                Title = title,
+                FilesModified = appliedFixes.Select(f => f.FilePath).ToList()
+            };
         }
         catch (Exception ex)
         {
